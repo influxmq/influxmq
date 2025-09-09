@@ -35,5 +35,5 @@ func (fs OSFileSystem) OpenFile(name string, flag int, perm os.FileMode) (File, 
 }
 
 func (fs OSFileSystem) ReadDir(dirname string) ([]os.DirEntry, error) {
-	return os.ReadDir(dirname)
+	return os.ReadDir(path.Join(fs.Dir, dirname))
 }

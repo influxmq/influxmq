@@ -2,6 +2,10 @@
 
 InfluxMQ is a lightweight, high-throughput **pub/sub message broker** designed to support **many independent topics** at scale, with **simple deployments** and tunable **write durability**.
 
+## Under Development
+
+This project is still in early development. If you find it interesting please give it a star. Once development is further along we will open to contributors for feedback.
+
 ### Project Goals
 
 - **Isolated Topics**  

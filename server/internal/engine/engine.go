@@ -5,9 +5,8 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"time"
 
-	sl "github.com/influxmq/influxmq/server/internal/storage/log"
+	"github.com/influxmq/influxmq/server/internal/stream"
 
 	"github.com/influxmq/influxmq/server/internal/memory"
 	"github.com/influxmq/influxmq/server/internal/proto"
@@ -24,24 +23,14 @@ const (
 type Engine struct {
 	*gnet.BuiltinEventEngine
 	pool memory.Pool
-	w *sl.LogWriter
+	sm *stream.StreamManager
 	dataPort int
 	ctlPort int
 }
 
-func NewEngine(w *sl.LogWriter, pool memory.Pool, dataPort, ctlPort int) *Engine {
-
-
-	go func(){
-		for {
-			time.Sleep(time.Millisecond*100)
-			w.Sync()
-		}
-	}()
-
+func NewEngine(sm *stream.StreamManager, pool memory.Pool, dataPort, ctlPort int) *Engine {
 	return &Engine{
-		w: w,
-		//mpsc: mpsc,
+		sm: sm,
 		pool: pool,
 		dataPort: dataPort,
 		ctlPort: ctlPort,
@@ -72,24 +61,28 @@ Ctl message: [len][message]
 */
 func (e *Engine) OnTraffic(c gnet.Conn) (gnet.Action) {
 
-	if c.InboundBuffered() < 4 {
-		return gnet.None
-	}
+	for {
+		if c.InboundBuffered() < 4 {
+			return gnet.None
+		}
 
-	header, _ := c.Peek(4)
-	msgLen := int(binary.BigEndian.Uint32(header))
+		header, _ := c.Peek(4)
+		msgLen := int(binary.BigEndian.Uint32(header))
 
-	if c.InboundBuffered() < 4+msgLen {
-		return gnet.None
-	}
+		if c.InboundBuffered() < 4+msgLen {
+			return gnet.None
+		}
 
-	c.Discard(4)
-	msg, _ := c.Next(msgLen)
+		c.Discard(4) // skip header
 
-	if c.Context() == trafficData {
-		return e.onData(c, msg)
-	} else {
-		return e.onCtl(c, msg)
+		// read the next message length
+		msg, _ := c.Next(msgLen)
+
+		if c.Context() == trafficData {
+			e.onData(c, msg)
+		} else {
+			e.onCtl(c, msg)
+		}
 	}
 }
 
@@ -109,18 +102,20 @@ func (e *Engine) onData(c gnet.Conn, msg []byte) (action gnet.Action) {
 		return e.onPublish(c, dm.PublishMsg)
 	}
 
-	log.Printf("stream %s data %s", string(dm.PublishMsg.Stream), string(dm.PublishMsg.Payload))
 	return
 }
 
-func (e *Engine) onPublish(_ gnet.Conn, msg *proto.PublishMessage) (action gnet.Action) {
+func (e *Engine) onPublish(c gnet.Conn, msg *proto.PublishMessage) (action gnet.Action) {
+	s := string(msg.Stream)
 
-	err := e.w.Write(msg.Payload)
+	rid, err := e.sm.Write(s, msg.Payload)
 
 	if err != nil {
-		log.Printf("Error writing %v", err)
-		return gnet.Close
+		log.Printf("Error writing %v for stream %s", err, s)
 	}
+
+	resp, _ := rid.Marshal()
+	c.AsyncWrite(resp, nil)
 
 	return
 }

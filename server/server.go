@@ -3,11 +3,12 @@ package server
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/influxmq/influxmq/server/internal/engine"
 	"github.com/influxmq/influxmq/server/internal/memory"
 	"github.com/influxmq/influxmq/server/internal/storage/fs"
-	"github.com/influxmq/influxmq/server/internal/storage/log"
+	"github.com/influxmq/influxmq/server/internal/stream"
 	"github.com/panjf2000/gnet/v2"
 )
 
@@ -35,22 +36,32 @@ func NewServer(dataDir string) (*Server, error){
 	fs := fs.OSFileSystem{
 		Dir: "./data",
 	}
-	
-	fs.MkdirAll(".", 0644)
 
-	w, err := log.NewLogWriter(fs, 0, make([]byte, 1 * 1000 * 1000), make([]byte, 5 * 1000))
-
-	if err != nil {
-		return nil, err
+	segmentPool := &sync.Pool{
+		New: func() any {
+			return make([]byte, 4 * 1000 * 1000)
+		},
 	}
 
+	sbp := memory.NewBufferPool(segmentPool)
+	
+	sm := stream.NewStreamManager(fs, sbp)
+
+	go func() {
+		for {
+			//todo: temporary flushing here
+			time.Sleep(time.Millisecond*100)
+			sm.Sync()
+		}
+	}()
+
 	return &Server{
-		e: engine.NewEngine(w, rbp, dataPort, ctlPort),
+		e: engine.NewEngine(sm, rbp, dataPort, ctlPort),
 		dataPort: dataPort,
 		ctlPort: ctlPort,
 	}, nil
 }
 
 func (s *Server) ListenAndServe() error {
-	return gnet.Rotate(s.e, []string{fmt.Sprintf("tcp://:%d", s.dataPort), fmt.Sprintf("tcp://:%d", s.ctlPort)}, gnet.WithMulticore(true), gnet.WithReusePort(true))
+	return gnet.Rotate(s.e, []string{fmt.Sprintf("tcp://:%d", s.dataPort), fmt.Sprintf("tcp://:%d", s.ctlPort)}, gnet.WithMulticore(true), gnet.WithReusePort(true), gnet.WithEdgeTriggeredIO(false))
 }
