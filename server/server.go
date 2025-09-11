@@ -56,12 +56,12 @@ func NewServer(dataDir string) (*Server, error){
 	}()
 
 	return &Server{
-		e: engine.NewEngine(sm, rbp, dataPort, ctlPort),
+		e: engine.NewEngine(sm, rbp),
 		dataPort: dataPort,
 		ctlPort: ctlPort,
 	}, nil
 }
 
 func (s *Server) ListenAndServe() error {
-	return gnet.Rotate(s.e, []string{fmt.Sprintf("tcp://:%d", s.dataPort), fmt.Sprintf("tcp://:%d", s.ctlPort)}, gnet.WithMulticore(true), gnet.WithReusePort(true), gnet.WithEdgeTriggeredIO(false))
+	return gnet.Run(s.e, fmt.Sprintf("tcp://:%d", s.dataPort), gnet.WithMulticore(true), gnet.WithReusePort(true), gnet.WithEdgeTriggeredIO(false))
 }

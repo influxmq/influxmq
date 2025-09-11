@@ -3,37 +3,25 @@ package engine
 import (
 	"encoding/binary"
 	"fmt"
-	"log"
-	"net"
 
 	"github.com/influxmq/influxmq/server/internal/stream"
+	"github.com/influxmq/influxmq/server/proto"
 
 	"github.com/influxmq/influxmq/server/internal/memory"
-	"github.com/influxmq/influxmq/server/internal/proto"
 	"github.com/panjf2000/gnet/v2"
-)
-
-type tafficType int
-
-const (
-	trafficData tafficType = iota
-	trafficCtl
 )
 
 type Engine struct {
 	*gnet.BuiltinEventEngine
 	pool memory.Pool
 	sm *stream.StreamManager
-	dataPort int
-	ctlPort int
+
 }
 
-func NewEngine(sm *stream.StreamManager, pool memory.Pool, dataPort, ctlPort int) *Engine {
+func NewEngine(sm *stream.StreamManager, pool memory.Pool) *Engine {
 	return &Engine{
 		sm: sm,
 		pool: pool,
-		dataPort: dataPort,
-		ctlPort: ctlPort,
 	}
 }
 
@@ -43,83 +31,108 @@ func (e *Engine) OnBoot(_ gnet.Engine) (action gnet.Action) {
 }
 
 func (e *Engine) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
-	port := c.LocalAddr().(*net.TCPAddr).Port
-
-	switch port {
-	case e.dataPort:
-		c.SetContext(trafficData)
-	case e.ctlPort:
-		c.SetContext(trafficCtl)
-	}
-
+	c.SetContext(memory.NewRingBuffer(e.pool.Get()))
 	return
 }
 
-/*
-Data messages: [len][message]
-Ctl message: [len][message]
-*/
-func (e *Engine) OnTraffic(c gnet.Conn) (gnet.Action) {
-
-	for {
-		if c.InboundBuffered() < 4 {
-			return gnet.None
-		}
-
-		header, _ := c.Peek(4)
-		msgLen := int(binary.BigEndian.Uint32(header))
-
-		if c.InboundBuffered() < 4+msgLen {
-			return gnet.None
-		}
-
-		c.Discard(4) // skip header
-
-		// read the next message length
-		msg, _ := c.Next(msgLen)
-
-		if c.Context() == trafficData {
-			e.onData(c, msg)
-		} else {
-			e.onCtl(c, msg)
-		}
-	}
+func (e *Engine) OnClose(c gnet.Conn, _ error) (action gnet.Action) {
+	ring := c.Context().(*memory.RingBuffer)
+	e.pool.Return(ring.Buffer())
+	return
 }
 
-func (e *Engine) onData(c gnet.Conn, msg []byte) (action gnet.Action) {
 
-	dm := proto.NewDataMessage(e.pool)
+func (e *Engine) OnTraffic(c gnet.Conn) (gnet.Action) {
 
-	err := dm.Unmarshal(msg); if err != nil {
-		log.Printf("could not unmsarhall data message %v", err)
+	buf, err := c.Next(-1); if err != nil {
 		return gnet.Close
 	}
 
-	defer dm.Close()
+	ring := c.Context().(*memory.RingBuffer)
 
-	switch dm.MessageType {
-	case proto.MessagePublish:
-		return e.onPublish(c, dm.PublishMsg)
+	if !ProcessWithRingSupport(buf, ring) {
+		return gnet.Close
 	}
 
-	return
+	return gnet.None
 }
 
-func (e *Engine) onPublish(c gnet.Conn, msg *proto.PublishMessage) (action gnet.Action) {
-	s := string(msg.Stream)
 
-	rid, err := e.sm.Write(s, msg.Payload)
+func ProcessWithRingSupport(buf []byte, ring *memory.RingBuffer) bool {
+	offset := 0
+	bufLen := len(buf)
 
-	if err != nil {
-		log.Printf("Error writing %v for stream %s", err, s)
+	for {
+		if ring.Len() > 0 {
+			// Combine ring + buf for logical full message
+			if ring.Len() < 4 {
+				// Not enough to get length — append what we can
+				_, ok := ring.Write(buf[offset:])
+				return ok
+			}
+
+			lenBytes, _ := ring.Peek(4)
+			msgLen := binary.LittleEndian.Uint32(lenBytes)
+			totalLen := 4 + int(msgLen)
+
+			available := ring.Len() + (bufLen - offset)
+			if available < totalLen {
+				// Still not enough — copy rest of buf and wait
+				_, ok := ring.Write(buf[offset:])
+				return ok
+			}
+
+			// Now we can fulfill the message by combining
+			temp := make([]byte, totalLen)
+			n := copy(temp, ring.Read(ring.Len()))
+			copy(temp[n:], buf[offset:offset+(totalLen-n)])
+			offset += totalLen - n
+
+			var msg proto.Message
+			if _, err := msg.Read(temp); err != nil {
+				fmt.Println("Parse error:", err)
+				return true
+			}
+
+			// ==========================
+			// message ready
+			// ==========================
+
+			fmt.Print(msg)
+
+
+		} else {
+			// Ring is empty, parse directly from buf
+			if bufLen-offset < 4 {
+				_, ok := ring.Write(buf[offset:])
+				return ok
+			}
+
+			msgLen := binary.LittleEndian.Uint32(buf[offset : offset+4])
+			totalLen := 4 + int(msgLen)
+
+			if bufLen-offset < totalLen {
+				// Partial message — copy into ring
+				_, ok := ring.Write(buf[offset:])
+				return ok
+			}
+
+			// Full message
+			msgBuf := buf[offset : offset+totalLen]
+
+			var msg proto.Message
+			if _, err := msg.Read(msgBuf); err != nil {
+				fmt.Println("Parse error:", err)
+				return true
+			}
+
+			// ==========================
+			// message ready
+			// ==========================
+
+			fmt.Print(msg)
+
+			offset += totalLen
+		}
 	}
-
-	resp, _ := rid.Marshal()
-	c.AsyncWrite(resp, nil)
-
-	return
-}
-
-func (e *Engine) onCtl(_ gnet.Conn, _ []byte) (action gnet.Action) {
-	return
 }
